@@ -1,2 +1,0 @@
-binwalk 2.jpg
-dd if=2.jpg of=3.jpg skip=158792 bs=1
