@@ -1,0 +1,277 @@
+看代码
+逻辑
+架构
+单个功能
+
+passthru函数源码分析
+
+zend.h
+#define INTERNAL_FUNCTION_PARAMETERS zend_execute_data *execute_data, zval *return_value
+#define INTERNAL_FUNCTION_PARAM_PASSTHRU execute_data, return_value
+
+exec.c
+/* {{{ Execute an external program */
+PHP_FUNCTION(exec) // 执行外部程序
+{
+  php_exec_ex(INTERNAL_FUNCTION_PARAM_PASSTHRU, 0);
+}
+/* }}} */
+
+/* {{{ Execute an external program and display output */
+PHP_FUNCTION(system) // 执行一个外部程序并显示输出
+{
+  php_exec_ex(INTERNAL_FUNCTION_PARAM_PASSTHRU, 1);
+}
+/* }}} */
+
+/* {{{ Execute an external program and display raw output */
+PHP_FUNCTION(passthru) // 执行一个外部程序，并显示原始输出
+{
+  php_exec_ex(INTERNAL_FUNCTION_PARAM_PASSTHRU, 3);
+}
+/* }}} */
+
+exec.c
+static void php_exec_ex(INTERNAL_FUNCTION_PARAMETERS, int mode) /* {{{ */
+{
+  char *cmd;
+  size_t cmd_len;
+  zval *ret_code = NULL, *ret_array = NULL;
+  int ret;
+
+  ZEND_PARSE_PARAMETERS_START(1, (mode ? 2 : 3))
+  Z_PARAM_STRING(cmd, cmd_len)
+  Z_PARAM_OPTIONAL
+  if (!mode)
+  {
+    Z_PARAM_ZVAL(ret_array)
+  }
+  Z_PARAM_ZVAL(ret_code)
+  ZEND_PARSE_PARAMETERS_END();
+
+  if (!cmd_len)
+  {
+    zend_argument_value_error(1, "cannot be empty");
+    RETURN_THROWS();
+  }
+  if (strlen(cmd) != cmd_len)
+  {
+    zend_argument_value_error(1, "must not contain any null bytes");
+    RETURN_THROWS();
+  }
+
+  if (!ret_array)
+  {
+    ret = php_exec(mode, cmd, NULL, return_value);
+  }
+  else
+  {
+    if (Z_TYPE_P(Z_REFVAL_P(ret_array)) == IS_ARRAY)
+    {
+      ZVAL_DEREF(ret_array);
+      SEPARATE_ARRAY(ret_array);
+    }
+    else
+    {
+      ret_array = zend_try_array_init(ret_array);
+      if (!ret_array)
+      {
+        RETURN_THROWS();
+      }
+    }
+
+    ret = php_exec(2, cmd, ret_array, return_value);
+  }
+  if (ret_code)
+  {
+    ZEND_TRY_ASSIGN_REF_LONG(ret_code, ret);
+  }
+}
+/* }}} */
+
+exec.c
+/* {{{ php_exec
+ * If type==0, only last line of output is returned (exec)
+ * If type==1, all lines will be printed and last lined returned (system)
+ * If type==2, all lines will be saved to given array (exec with &$array)
+ * If type==3, output will be printed binary, no lines will be saved or returned (passthru)
+ *
+ */
+PHPAPI int php_exec(int type, const char *cmd, zval *array, zval *return_value)
+{
+  FILE *fp;
+  char *buf;
+  int pclose_return;
+  char *b, *d = NULL;
+  php_stream *stream;
+  size_t buflen, bufl = 0;
+#if PHP_SIGCHILD
+  void (*sig_handler)() = NULL;
+#endif
+
+#if PHP_SIGCHILD
+  sig_handler = signal(SIGCHLD, SIG_DFL);
+#endif
+
+#ifdef PHP_WIN32
+  fp = VCWD_POPEN(cmd, "rb");
+#else
+  fp = VCWD_POPEN(cmd, "r");
+#endif
+  if (!fp)
+  {
+    php_error_docref(NULL, E_WARNING, "Unable to fork [%s]", cmd);
+    goto err;
+  }
+
+  stream = php_stream_fopen_from_pipe(fp, "rb");
+
+  buf = (char *)emalloc(EXEC_INPUT_BUF);
+  buflen = EXEC_INPUT_BUF;
+
+  if (type != 3)
+  {
+    b = buf;
+
+    while (php_stream_get_line(stream, b, EXEC_INPUT_BUF, &bufl))
+    {
+      /* no new line found, let's read some more */
+      if (b[bufl - 1] != '\n' && !php_stream_eof(stream))
+      {
+        if (buflen < (bufl + (b - buf) + EXEC_INPUT_BUF))
+        {
+          bufl += b - buf;
+          buflen = bufl + EXEC_INPUT_BUF;
+          buf = erealloc(buf, buflen);
+          b = buf + bufl;
+        }
+        else
+        {
+          b += bufl;
+        }
+        continue;
+      }
+      else if (b != buf)
+      {
+        bufl += b - buf;
+      }
+
+      bufl = handle_line(type, array, buf, bufl);
+      b = buf;
+    }
+    if (bufl)
+    {
+      if (buf != b)
+      {
+        /* Process remaining output */
+        bufl = handle_line(type, array, buf, bufl);
+      }
+
+      /* Return last line from the shell command */
+      bufl = strip_trailing_whitespace(buf, bufl);
+      RETVAL_STRINGL(buf, bufl);
+    }
+    else
+    { /* should return NULL, but for BC we return "" */
+      RETVAL_EMPTY_STRING();
+    }
+  }
+  else
+  {
+    ssize_t read;
+    while ((read = php_stream_read(stream, buf, EXEC_INPUT_BUF)) > 0)
+    {
+      PHPWRITE(buf, read);
+    }
+  }
+
+  pclose_return = php_stream_close(stream);
+  efree(buf);
+
+done:
+#if PHP_SIGCHILD
+  if (sig_handler)
+  {
+    signal(SIGCHLD, sig_handler);
+  }
+#endif
+  if (d)
+  {
+    efree(d);
+  }
+  return pclose_return;
+err:
+  pclose_return = -1;
+  RETVAL_FALSE;
+  goto done;
+}
+/* }}} */
+
+exec.c
+#define VCWD_POPEN(command, type) popen(command, type)
+
+#define VCWD_POPEN(command, type) virtual_popen(command, type)
+
+#ifdef ZEND_WIN32
+CWD_API FILE *virtual_popen(const char *command, const char *type) /* {{{ */
+{
+	return popen_ex(command, type, CWDG(cwd).cwd, NULL);
+}
+/* }}} */
+#else /* Unix */
+CWD_API FILE *virtual_popen(const char *command, const char *type) /* {{{ */
+{
+	size_t command_length;
+	int dir_length, extra = 0;
+	char *command_line;
+	char *ptr, *dir;
+	FILE *retval;
+
+	command_length = strlen(command);
+
+	dir_length = CWDG(cwd).cwd_length;
+	dir = CWDG(cwd).cwd;
+	while (dir_length > 0) {
+		if (*dir == '\'') extra+=3;
+		dir++;
+		dir_length--;
+	}
+	dir_length = CWDG(cwd).cwd_length;
+	dir = CWDG(cwd).cwd;
+
+	ptr = command_line = (char *) emalloc(command_length + sizeof("cd '' ; ") + dir_length + extra+1+1);
+	memcpy(ptr, "cd ", sizeof("cd ")-1);
+	ptr += sizeof("cd ")-1;
+
+	if (CWDG(cwd).cwd_length == 0) {
+		*ptr++ = DEFAULT_SLASH;
+	} else {
+		*ptr++ = '\'';
+		while (dir_length > 0) {
+			switch (*dir) {
+			case '\'':
+				*ptr++ = '\'';
+				*ptr++ = '\\';
+				*ptr++ = '\'';
+				ZEND_FALLTHROUGH;
+			default:
+				*ptr++ = *dir;
+			}
+			dir++;
+			dir_length--;
+		}
+		*ptr++ = '\'';
+	}
+
+	*ptr++ = ' ';
+	*ptr++ = ';';
+	*ptr++ = ' ';
+
+	memcpy(ptr, command, command_length+1);
+	retval = popen(command_line, type);
+
+	efree(command_line);
+	return retval;
+}
+/* }}} */
+#endif
